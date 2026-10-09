@@ -193,6 +193,317 @@ function parseTeacherText(text) {
   return { names, warnings: [] };
 }
 
+// ---------- room plan: rooms + layout + branch rules (read from a file) ----------
+
+// "CSE, ECE" / "CSE and ECE" / "CSE+ECE" / "CSE / ECE" -> ["CSE", "ECE"]
+function splitBranchList(text) {
+  return String(text)
+    .split(/[,;|/&+]|\band\b/i)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+// Understands the ways people naturally write a room's branch rule:
+//   (blank), ALL, any, mixed, everyone      -> any branch
+//   CSE / CSE only / only CSE               -> just that branch
+//   CSE, ECE / CSE and ECE / CSE + ECE      -> those branches mixed together
+//   ALL except ECE / not ECE / except ECE   -> every branch but those
+//   CSE:30, ECE:20 / CSE (30) / CSE=30      -> allowed, with a maximum per branch
+function parseBranchCondition(raw) {
+  const text = String(raw ?? "").trim();
+  const cond = { any: false, only: [], except: [], quotas: {} };
+
+  if (
+    !text ||
+    /^(all|any|every(one| branch(es)?)?|mixed|open|\*|no restrictions?)( branch(es)?| students?)?$/i.test(text)
+  ) {
+    cond.any = true;
+    return cond;
+  }
+
+  const exceptMatch = text.match(
+    /^(?:(?:all|any|every(?:one)?|mixed)(?:\s+branch(?:es)?)?\s*)?(?:except|excluding|exclude|but not|but|not|without|other than)\s+(.+)$/i
+  );
+  if (exceptMatch) {
+    cond.any = true;
+    cond.except = splitBranchList(exceptMatch[1]);
+    return cond;
+  }
+
+  const cleaned = text.replace(
+    /\b(only|just|exclusively|branches|branch|students|student|departments|department|depts|dept)\b\.?/gi,
+    " "
+  );
+  for (const token of splitBranchList(cleaned)) {
+    const q = token.match(/^(.+?)\s*(?:[:=]|\()\s*(\d+)\s*\)?\s*$/);
+    if (q) {
+      const name = q[1].trim();
+      cond.only.push(name);
+      cond.quotas[name.toLowerCase()] = parseInt(q[2], 10);
+    } else {
+      cond.only.push(token);
+    }
+  }
+  if (cond.only.length === 0) cond.any = true;
+  return cond;
+}
+
+function describeCondition(cond) {
+  if (cond.any && cond.except.length) return `All except ${cond.except.join(", ")}`;
+  if (cond.any) return "Any branch";
+  const parts = cond.only.map((n) => {
+    const q = cond.quotas[n.toLowerCase()];
+    return q !== undefined ? `${n} (max ${q})` : n;
+  });
+  return parts.length === 1 ? `${parts[0]} only` : parts.join(" + ");
+}
+
+// Matches the names in a rule against the branches that really exist in the student
+// list (case-insensitive) and returns what the room may seat.
+function resolveCondition(cond, branchOrder) {
+  const lookup = {};
+  branchOrder.forEach((b) => {
+    lookup[b.toLowerCase()] = b;
+  });
+  const unknown = [];
+  let allowed = [];
+  if (cond.any) {
+    const ex = new Set(cond.except.map((n) => n.toLowerCase()));
+    cond.except.forEach((n) => {
+      if (!lookup[n.toLowerCase()]) unknown.push(n);
+    });
+    allowed = branchOrder.filter((b) => !ex.has(b.toLowerCase()));
+  } else {
+    for (const n of cond.only) {
+      const m = lookup[n.toLowerCase()];
+      if (!m) unknown.push(n);
+      else if (!allowed.includes(m)) allowed.push(m);
+    }
+  }
+  const quotas = {};
+  Object.entries(cond.quotas).forEach(([k, v]) => {
+    if (lookup[k]) quotas[lookup[k]] = v;
+  });
+  return { allowed, quotas, unknown };
+}
+
+// Works out which column holds what, from one heading row. Returns null if the row
+// doesn't look like a heading for a room plan (needs rows, benches and seats columns).
+function detectRoomPlanColumns(headingRow) {
+  const header = (headingRow || []).map((h) => String(h ?? "").trim().toLowerCase());
+  const used = new Set();
+  const pick = (test) => {
+    const found = [];
+    header.forEach((h, i) => {
+      if (!used.has(i) && h && test(h)) found.push(i);
+    });
+    found.forEach((i) => used.add(i));
+    return found;
+  };
+  const condCols = pick((h) => /branch|dept|department|condition|allow|rule|restrict|stream/.test(h));
+  const seatCols = pick((h) => /seat|student|person|people|occup/.test(h));
+  const rowCols = pick((h) => /row/.test(h) && !/bench/.test(h));
+  const benchCols = pick((h) => /bench/.test(h));
+  const nameCols = pick((h) => /room|hall|class|lab|venue/.test(h));
+  if (!rowCols.length || !benchCols.length || !seatCols.length) return null;
+  return {
+    name: nameCols.length ? nameCols[0] : -1,
+    rows: rowCols[0],
+    benches: benchCols[0],
+    seats: seatCols[0],
+    cond: condCols,
+  };
+}
+
+// Reads a 2D array of rows (Excel/CSV) describing the rooms. Finds the heading row
+// (even if there's a title above it) and the columns by their headings, in any order;
+// if there are no usable headings, falls back to Room, Rows, Benches, Seats, Branches.
+function parseRoomPlanSheet(rows) {
+  const warnings = [];
+  if (!rows || rows.length === 0) {
+    return { rooms: [], warnings: ["The file appears to be empty."] };
+  }
+
+  let idx = null;
+  let start = 1;
+  for (let h = 0; h < Math.min(rows.length, 6) && !idx; h += 1) {
+    idx = detectRoomPlanColumns(rows[h]);
+    if (idx) start = h + 1;
+  }
+  if (!idx) {
+    const widest = Math.max(...rows.map((r) => (r ? r.length : 0)));
+    idx = {
+      name: 0,
+      rows: 1,
+      benches: 2,
+      seats: 3,
+      cond: Array.from({ length: Math.max(0, widest - 4) }, (_, i) => i + 4),
+    };
+    const firstIsData =
+      Number.isFinite(parseInt(rows[0]?.[1], 10)) && Number.isFinite(parseInt(rows[0]?.[2], 10));
+    start = firstIsData ? 0 : 1;
+    warnings.push(
+      "Couldn't match the column headings, so columns were read in this order: Room, Rows, Benches per row, Seats per bench, Branches allowed."
+    );
+  }
+
+  const out = [];
+  for (let r = start; r < rows.length; r += 1) {
+    const row = rows[r] || [];
+    if (row.every((c) => c === undefined || c === null || String(c).trim() === "")) continue;
+    const label = idx.name >= 0 ? String(row[idx.name] ?? "").trim() : "";
+    const nRows = parseInt(row[idx.rows], 10);
+    const nBenches = parseInt(row[idx.benches], 10);
+    const nSeats = parseInt(row[idx.seats], 10);
+    if (![nRows, nBenches, nSeats].every((n) => Number.isFinite(n) && n >= 1)) {
+      warnings.push(
+        `Line ${r + 1}${label ? ` (${label})` : ""}: rows, benches and seats must be whole numbers — skipped.`
+      );
+      continue;
+    }
+    const condText = idx.cond
+      .map((i) => String(row[i] ?? "").trim())
+      .filter(Boolean)
+      .join(", ");
+    const cond = parseBranchCondition(condText);
+    out.push({
+      name: label,
+      rows: nRows,
+      benches: nBenches,
+      seats: nSeats,
+      condition: cond,
+      conditionText: describeCondition(cond),
+    });
+  }
+  if (out.length === 0) warnings.push("No valid rooms were found.");
+  return { rooms: out, warnings };
+}
+
+// Reads rooms from plain text (Word/PDF). One room per line:
+//   Room 101, 3, 10, 2, CSE only
+//   Room 102 <tab> 3 <tab> 10 <tab> 2 <tab> CSE, ECE
+function parseRoomPlanText(text) {
+  const warnings = [];
+  const out = [];
+  let skipped = 0;
+  const lines = String(text).split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  for (const line of lines) {
+    const parts = line.split(/\t|\s{2,}|,|\|/).map((p) => p.trim()).filter(Boolean);
+    const nums = [parts[1], parts[2], parts[3]].map((p) => parseInt(p, 10));
+    if (parts.length < 4 || !nums.every((n) => Number.isFinite(n) && n >= 1)) {
+      // A heading line such as "Room, Rows, Benches, Seats, Branches" is expected - don't warn.
+      if (!/row|bench|seat/i.test(line)) skipped += 1;
+      continue;
+    }
+    const cond = parseBranchCondition(parts.slice(4).join(", "));
+    out.push({
+      name: parts[0],
+      rows: nums[0],
+      benches: nums[1],
+      seats: nums[2],
+      condition: cond,
+      conditionText: describeCondition(cond),
+    });
+  }
+  if (skipped > 0) warnings.push(`${skipped} line(s) couldn't be read as a room and were skipped.`);
+  if (out.length === 0) {
+    warnings.push(
+      "No rooms were recognized. Put one room per line, e.g. 'Room 101, 3, 10, 2, CSE only' (room, rows, benches per row, seats per bench, branches allowed)."
+    );
+  }
+  return { rooms: out, warnings };
+}
+
+// Seats students room by room, following each room's own layout and branch rule.
+// Rooms are filled in the order they appear in the plan. A room never takes a branch
+// its rule doesn't allow, and never exceeds a branch's per-room maximum.
+function seatByRoomPlan({ plan, queues, branchOrder, avoidSameBranch }) {
+  let conflicts = 0;
+  const warnings = [];
+  const mentioned = new Set();
+  const rooms = [];
+
+  for (const room of plan) {
+    const { allowed, quotas, unknown } = resolveCondition(room.condition, branchOrder);
+    allowed.forEach((b) => mentioned.add(b));
+    if (unknown.length) {
+      warnings.push(
+        `${room.name}: "${unknown.join('", "')}" isn't a branch in the student list, so it was ignored.`
+      );
+    }
+    if (allowed.length === 0) {
+      warnings.push(`${room.name}: its rule doesn't match any branch, so this room stays empty.`);
+    }
+
+    const seatedHere = {};
+    allowed.forEach((b) => {
+      seatedHere[b] = 0;
+    });
+    const eligible = () =>
+      allowed.filter(
+        (b) => queues[b].length > 0 && (quotas[b] === undefined || seatedHere[b] < quotas[b])
+      );
+    // A room that may only hold one branch can't keep branches apart on a bench, and
+    // that's the person's own rule - so it isn't counted as a clash.
+    const canMix = allowed.length > 1;
+
+    const usedBranches = new Set();
+    const rows = [];
+    for (let r = 0; r < room.rows; r += 1) {
+      const benches = [];
+      for (let b = 0; b < room.benches; b += 1) {
+        const usedThisBench = new Set();
+        const seats = [];
+        for (let s = 0; s < room.seats; s += 1) {
+          const candidates = eligible();
+          if (candidates.length === 0) {
+            seats.push(null);
+            continue;
+          }
+          let pick;
+          if (avoidSameBranch && canMix) {
+            let fresh = candidates.filter((x) => !usedThisBench.has(x));
+            if (fresh.length === 0) {
+              fresh = candidates;
+              conflicts += 1;
+            }
+            fresh = [...fresh].sort((a, c) => queues[c].length - queues[a].length);
+            pick = fresh[0];
+          } else {
+            pick = candidates[0];
+          }
+          seats.push(queues[pick].shift());
+          seatedHere[pick] += 1;
+          usedThisBench.add(pick);
+          usedBranches.add(pick);
+        }
+        benches.push(seats);
+      }
+      rows.push(benches);
+    }
+
+    rooms.push({
+      name: room.name,
+      conditionText: room.conditionText,
+      allowedBranches: allowed.filter((b) => usedBranches.has(b)),
+      layout: { rows: room.rows, benches: room.benches, seats: room.seats },
+      rows,
+    });
+  }
+
+  branchOrder.forEach((b) => {
+    const left = queues[b].length;
+    if (left === 0) return;
+    warnings.push(
+      mentioned.has(b)
+        ? `${left} ${b} student(s) couldn't be seated — the rooms whose rules allow ${b} are full.`
+        : `${left} ${b} student(s) couldn't be seated — no room in the plan allows ${b}.`
+    );
+  });
+
+  return { rooms, conflicts, warnings };
+}
+
 export default function ExamSeatingRegister() {
   const [inputMode, setInputMode] = useState("manual"); // "manual" | "upload"
 
@@ -212,6 +523,13 @@ export default function ExamSeatingRegister() {
   const [rowsPerRoom, setRowsPerRoom] = useState(3);
   const [benchesPerRow, setBenchesPerRow] = useState(10);
   const [seatsPerBench, setSeatsPerBench] = useState(2);
+  const [roomMode, setRoomMode] = useState("same"); // "same" | "plan"
+  const [roomPlan, setRoomPlan] = useState([]);
+  const [roomPlanFileNames, setRoomPlanFileNames] = useState([]);
+  const [roomPlanDuplicatesRemoved, setRoomPlanDuplicatesRemoved] = useState(0);
+  const [roomPlanWarnings, setRoomPlanWarnings] = useState([]);
+  const [roomPlanError, setRoomPlanError] = useState("");
+  const [roomPlanParsing, setRoomPlanParsing] = useState(false);
   const [branchesPerRoom, setBranchesPerRoom] = useState(2);
   const [branchGroupMode, setBranchGroupMode] = useState("auto"); // "auto" | "custom"
   const [customGroupsText, setCustomGroupsText] = useState("");
@@ -229,6 +547,13 @@ export default function ExamSeatingRegister() {
   const [teachersPerRoom, setTeachersPerRoom] = useState(1);
   const [result, setResult] = useState(null);
   const [activeRoom, setActiveRoom] = useState(0);
+  const [viewMode, setViewMode] = useState("sheet"); // "sheet" | "cards"
+  const [noticeTitle, setNoticeTitle] = useState(
+    "Exam: AY 2026-27 (ODD) | MSE-1 | SEMESTER-5/7"
+  );
+  const [noticeDate, setNoticeDate] = useState("");
+  const [noticeTime, setNoticeTime] = useState("");
+  const [roomNumbersText, setRoomNumbersText] = useState("");
   const [error, setError] = useState("");
 
   function updateRange(id, field, value) {
@@ -400,9 +725,115 @@ export default function ExamSeatingRegister() {
     setTeacherUploadFileNames([]);
   }
 
+  async function handleRoomPlanUpload(e) {
+    const files = Array.from(e.target.files || []);
+    e.target.value = ""; // lets the same file be picked again later
+    if (!files.length) return;
+
+    setRoomPlanError("");
+    setRoomPlanParsing(true);
+
+    const collected = [];
+    const newWarnings = [];
+    const loadedNames = [];
+
+    // Each file has its own try/catch, so one bad file never blocks the rest.
+    for (const file of files) {
+      try {
+        const ext = file.name.split(".").pop().toLowerCase();
+        let parsed;
+
+        if (["xlsx", "xls", "csv"].includes(ext)) {
+          const wb = XLSX.read(await file.arrayBuffer(), { type: "array" });
+          // Read every sheet, so a plan split across tabs (e.g. one per block) still works.
+          const found = [];
+          let firstWarnings = null;
+          wb.SheetNames.forEach((sheetName) => {
+            const one = parseRoomPlanSheet(
+              XLSX.utils.sheet_to_json(wb.Sheets[sheetName], { header: 1 })
+            );
+            if (firstWarnings === null) firstWarnings = one.warnings;
+            if (one.rooms.length > 0) {
+              found.push(...one.rooms);
+              newWarnings.push(
+                ...one.warnings.map((w) => `${file.name} (${sheetName}): ${w}`)
+              );
+            }
+          });
+          parsed = { rooms: found, warnings: found.length ? [] : firstWarnings || [] };
+        } else if (ext === "docx") {
+          const { value } = await mammoth.extractRawText({ arrayBuffer: await file.arrayBuffer() });
+          parsed = parseRoomPlanText(value);
+        } else if (ext === "pdf") {
+          parsed = parseRoomPlanText(await pdfToText(await file.arrayBuffer()));
+        } else {
+          newWarnings.push(`${file.name}: unsupported file type ".${ext}", skipped.`);
+          continue;
+        }
+
+        collected.push(...parsed.rooms);
+        newWarnings.push(...parsed.warnings.map((w) => `${file.name}: ${w}`));
+        if (parsed.rooms.length > 0) loadedNames.push(file.name);
+      } catch (err) {
+        newWarnings.push(`${file.name}: couldn't be read (${err.message}), skipped.`);
+      }
+    }
+
+    // Merge into the existing plan; a room name that's already there is skipped.
+    const seen = new Set(roomPlan.map((r) => r.name.trim().toLowerCase()));
+    const fresh = [];
+    let dupes = 0;
+    for (const room of collected) {
+      const name = room.name || String(roomPlan.length + fresh.length + 1);
+      const key = name.trim().toLowerCase();
+      if (seen.has(key)) {
+        dupes += 1;
+        continue;
+      }
+      seen.add(key);
+      fresh.push({ ...room, name });
+    }
+
+    setRoomPlan((prev) => [...prev, ...fresh]);
+    setRoomPlanDuplicatesRemoved((c) => c + dupes);
+    setRoomPlanFileNames((prev) => [...prev, ...loadedNames.filter((n) => !prev.includes(n))]);
+    setRoomPlanWarnings((prev) => [...prev, ...newWarnings]);
+    if (collected.length === 0) {
+      setRoomPlanError("No rooms were found in the selected file(s).");
+    }
+    setRoomPlanParsing(false);
+  }
+
+  function clearRoomPlan() {
+    setRoomPlan([]);
+    setRoomPlanFileNames([]);
+    setRoomPlanDuplicatesRemoved(0);
+    setRoomPlanWarnings([]);
+    setRoomPlanError("");
+  }
+
+  // Builds a small example sheet in the browser so the expected format is obvious.
+  function downloadSampleRoomPlan() {
+    const sheetRows = [
+      ["Room", "Rows", "Benches per row", "Seats per bench", "Branches allowed"],
+      ["101", 3, 5, 2, "CSE only"],
+      ["102", 3, 5, 2, "CSE, ECE"],
+      ["103", 3, 5, 2, "ECE, ISE"],
+      ["104", 3, 5, 2, "ALL except CSE"],
+      ["105", 3, 5, 2, "AIDS:15, AIML:15"],
+      ["106", 3, 5, 2, "ALL"],
+    ];
+    const ws = XLSX.utils.aoa_to_sheet(sheetRows);
+    ws["!cols"] = [{ wch: 10 }, { wch: 8 }, { wch: 16 }, { wch: 16 }, { wch: 28 }];
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "Room plan");
+    XLSX.writeFile(wb, "room_plan_sample.xlsx");
+  }
+
   function generate() {
     setError("");
 
+    const usingPlan = roomMode === "plan";
     const branchOrder = [];
     const queues = {};
     const studentDetails = {}; // id -> { name, subject }
@@ -457,7 +888,12 @@ export default function ExamSeatingRegister() {
       }
     }
 
-    if (
+    if (usingPlan) {
+      if (roomPlan.length === 0) {
+        setError("Upload a room plan first (or switch back to the same layout for every room).");
+        return;
+      }
+    } else if (
       classrooms < 1 ||
       rowsPerRoom < 1 ||
       benchesPerRow < 1 ||
@@ -475,7 +911,11 @@ export default function ExamSeatingRegister() {
 
     const totalStudents = branchOrder.reduce((sum, b) => sum + queues[b].length, 0);
     const capacityPerRoom = rowsPerRoom * benchesPerRow * seatsPerBench;
-    const capacity = classrooms * capacityPerRoom;
+    const roomCount = usingPlan ? roomPlan.length : classrooms;
+    const capacity = usingPlan
+      ? roomPlan.reduce((sum, r) => sum + r.rows * r.benches * r.seats, 0)
+      : classrooms * capacityPerRoom;
+    let planWarnings = [];
 
     let conflicts = 0;
 
@@ -600,18 +1040,27 @@ export default function ExamSeatingRegister() {
       return groups;
     }
 
-    const startingGroups = computeStartingGroups();
-    const rooms = [];
-    for (const group of startingGroups) {
-      while (rooms.length < classrooms && group.some((b) => queues[b].length > 0)) {
-        const usedBranchesSet = new Set(group.filter((b) => queues[b].length > 0));
-        const rows = fillRoom(group, usedBranchesSet);
-        rooms.push({ allowedBranches: [...usedBranchesSet], rows });
+    let rooms = [];
+    if (usingPlan) {
+      // Room plan uploaded: every room has its own layout and its own branch rule.
+      const planned = seatByRoomPlan({ plan: roomPlan, queues, branchOrder, avoidSameBranch });
+      rooms = planned.rooms;
+      conflicts = planned.conflicts;
+      planWarnings = planned.warnings;
+    } else {
+      const sameLayout = { rows: rowsPerRoom, benches: benchesPerRow, seats: seatsPerBench };
+      const startingGroups = computeStartingGroups();
+      for (const group of startingGroups) {
+        while (rooms.length < classrooms && group.some((b) => queues[b].length > 0)) {
+          const usedBranchesSet = new Set(group.filter((b) => queues[b].length > 0));
+          const rows = fillRoom(group, usedBranchesSet);
+          rooms.push({ allowedBranches: [...usedBranchesSet], layout: sameLayout, rows });
+        }
+        if (rooms.length >= classrooms) break;
       }
-      if (rooms.length >= classrooms) break;
-    }
-    while (rooms.length < classrooms) {
-      rooms.push({ allowedBranches: [], rows: emptyRows() });
+      while (rooms.length < classrooms) {
+        rooms.push({ allowedBranches: [], layout: sameLayout, rows: emptyRows() });
+      }
     }
 
     const unassigned = branchOrder.flatMap((b) => queues[b]);
@@ -628,7 +1077,7 @@ export default function ExamSeatingRegister() {
     const roomTeachers = [];
     if (names.length > 0) {
       let cursor = 0;
-      for (let c = 0; c < classrooms; c += 1) {
+      for (let c = 0; c < roomCount; c += 1) {
         const group = [];
         for (let t = 0; t < teachersPerRoom; t += 1) {
           if (cursor >= shuffled.length) {
@@ -641,7 +1090,7 @@ export default function ExamSeatingRegister() {
         roomTeachers.push(group);
       }
     } else {
-      for (let c = 0; c < classrooms; c += 1) roomTeachers.push([]);
+      for (let c = 0; c < roomCount; c += 1) roomTeachers.push([]);
     }
 
     setResult({
@@ -655,6 +1104,8 @@ export default function ExamSeatingRegister() {
       studentDetails,
       branchOf,
       branchOrder: [...branchOrder],
+      usingPlan,
+      planWarnings,
     });
     setActiveRoom(0);
   }
@@ -663,6 +1114,25 @@ export default function ExamSeatingRegister() {
     if (!result) return 0;
     return result.totalStudents - result.unassigned.length;
   }, [result]);
+
+  const customRoomNumbers = roomNumbersText
+    .split(",")
+    .map((n) => n.trim())
+    .filter(Boolean);
+  // Heading for a room's tab / title: "Room 101" for a room named in the plan,
+  // otherwise "Room 01", "Room 02"...
+  function roomTitle(room, i) {
+    const n = room && room.name;
+    if (!n) return `Room ${String(i + 1).padStart(2, "0")}`;
+    return /^(room|hall|lab|class)/i.test(n) ? n : `Room ${n}`;
+  }
+  // The bare number shown after "Room No :" on the printed sheet. Numbers typed in the
+  // "Room numbers" box win; otherwise the name from the room plan; otherwise 1, 2, 3...
+  function roomLabel(i) {
+    if (customRoomNumbers[i]) return customRoomNumbers[i];
+    const n = result && result.rooms[i] && result.rooms[i].name;
+    return n ? n.replace(/^room\s*[-:#]?\s*/i, "") : String(i + 1);
+  }
 
   return (
     <div className="esr-wrap">
@@ -991,11 +1461,63 @@ export default function ExamSeatingRegister() {
           .esr-room-body { padding: 14px; }
         }
 
+        /* ---------- room plan upload ---------- */
+        .esr-plan-table { width: 100%; margin-top: 10px; border-collapse: collapse; font-size: 12px; }
+        .esr-plan-table th, .esr-plan-table td {
+          text-align: left; padding: 4px 6px; border-bottom: 1px solid rgba(15,118,110,.25);
+        }
+        .esr-plan-table th { font-weight: 700; }
+        .esr-rule-list { margin: 4px 0 0; padding-left: 18px; }
+        .esr-rule-list li { margin-bottom: 3px; }
+        .esr-rule-list code {
+          background: var(--paper); border: 1px solid var(--line); border-radius: 4px;
+          padding: 0 4px; font-size: 11.5px; color: var(--ink);
+        }
+
+        /* ---------- printed exam-notice sheet ---------- */
+        .esr-sheet {
+          background: #fff; color: #000;
+          border: 1px solid var(--line); border-radius: 6px;
+          padding: 18px 18px 22px; overflow-x: auto;
+        }
+        .esr-sheet-head {
+          display: flex; justify-content: space-between; align-items: baseline; gap: 12px;
+          font: 700 14px 'Figtree', sans-serif; margin-bottom: 6px;
+        }
+        .esr-sheet-subhead {
+          display: grid; grid-template-columns: 1fr auto 1fr; gap: 12px;
+          font: 700 14px 'Figtree', sans-serif; margin-bottom: 12px;
+        }
+        .esr-sheet-subhead span:last-child { text-align: right; }
+        .esr-sheet-blocks { display: flex; gap: 18px; align-items: flex-start; }
+        table.esr-sheet-table { border-collapse: collapse; flex: 1 1 0; min-width: 0; }
+        .esr-sheet-table th {
+          border: 1.5px solid #000; padding: 8px 6px; text-align: center;
+          font: 700 14px 'Figtree', sans-serif; white-space: nowrap;
+        }
+        .esr-sheet-table th.esr-sheet-corner { border: none; width: 22px; }
+        .esr-sheet-table td {
+          border-left: 1.5px solid #000; border-right: 1.5px solid #000;
+          padding: 9px 6px; text-align: center; white-space: nowrap;
+          font: 400 12.5px Cambria, Georgia, 'Times New Roman', serif;
+        }
+        .esr-sheet-table tbody tr:last-child td { border-bottom: 1.5px solid #000; }
+        .esr-sheet-table td.esr-sheet-idx {
+          border: none; width: 22px; padding: 9px 4px 9px 0; text-align: right;
+          font: 400 11px 'Figtree', sans-serif; color: #000;
+        }
+
         @media print {
           .esr-wrap { background: #fff; padding: 0; }
-          .esr-plate, .esr-left, .esr-tabs, .esr-print-btn, .esr-summary { display: none !important; }
+          .esr-plate, .esr-left, .esr-tabs, .esr-print-btn, .esr-summary,
+          .esr-legend, .esr-layout-note, .esr-note,
+          .esr-room-head .esr-mode-toggle { display: none !important; }
           .esr-grid { display: block; margin: 0; padding: 0; }
           .esr-output { border: none; box-shadow: none; }
+          .esr-room-body { padding: 0; }
+          .esr-sheet { border: none; padding: 0; overflow: visible; }
+          .esr-sheet-blocks { gap: 14px; }
+          .esr-sheet-table { break-inside: avoid; }
           .esr-row-block { break-inside: avoid; }
           .esr-row-title { background: #e2e7ed; color: #000; }
         }
@@ -1064,7 +1586,6 @@ export default function ExamSeatingRegister() {
                       type="number"
                       placeholder="Start"
                       value={r.start}
-      
                       onChange={(e) => updateRange(r.id, "start", e.target.value)}
                     />
                     <input
@@ -1146,6 +1667,25 @@ export default function ExamSeatingRegister() {
             )}
 
             <label className="esr-field-label">Room configuration</label>
+            <div className="esr-mode-toggle">
+              <button
+                type="button"
+                className={`esr-mode-btn ${roomMode === "same" ? "active" : ""}`}
+                onClick={() => setRoomMode("same")}
+              >
+                Same layout for all rooms
+              </button>
+              <button
+                type="button"
+                className={`esr-mode-btn ${roomMode === "plan" ? "active" : ""}`}
+                onClick={() => setRoomMode("plan")}
+              >
+                Upload room plan
+              </button>
+            </div>
+
+            {roomMode === "same" && (
+              <>
             <div className="esr-num-row">
               <div className="esr-num-field">
                 <label>Classrooms</label>
@@ -1230,6 +1770,111 @@ export default function ExamSeatingRegister() {
                   room holds). Any branch you don't mention still gets seated on its
                   own afterward, and a room will never sit empty if a later branch still
                   has students left.
+                </p>
+              </>
+            )}
+              </>
+            )}
+
+            {roomMode === "plan" && (
+              <>
+                <div className="esr-file-drop">
+                  <input
+                    type="file"
+                    accept=".xlsx,.xls,.csv,.docx,.pdf"
+                    onChange={handleRoomPlanUpload}
+                    multiple
+                  />
+                  {roomPlanParsing
+                    ? "Reading room plan…"
+                    : "Click or drop room plan files (.xlsx, .csv, .docx, .pdf)"}
+                  {roomPlanFileNames.length > 0 && !roomPlanParsing && (
+                    <div className="esr-file-name">
+                      {roomPlanFileNames.length} file(s) loaded — click here to add more
+                    </div>
+                  )}
+                </div>
+
+                {roomPlanError && <div className="esr-error">{roomPlanError}</div>}
+
+                {roomPlan.length > 0 && (
+                  <div className="esr-upload-summary">
+                    <strong>{roomPlan.length}</strong> room(s) loaded ·{" "}
+                    <strong>
+                      {roomPlan.reduce((sum, r) => sum + r.rows * r.benches * r.seats, 0)}
+                    </strong>{" "}
+                    seats in total
+                    {roomPlanDuplicatesRemoved > 0 && (
+                      <>
+                        {" "}
+                        · <strong>{roomPlanDuplicatesRemoved}</strong> repeated room(s) skipped
+                      </>
+                    )}
+                    <table className="esr-plan-table">
+                      <thead>
+                        <tr>
+                          <th>Room</th>
+                          <th>Layout</th>
+                          <th>Who sits here</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {roomPlan.map((r) => (
+                          <tr key={r.name}>
+                            <td>{r.name}</td>
+                            <td>
+                              {r.rows}×{r.benches}×{r.seats}
+                            </td>
+                            <td>{r.conditionText}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+
+                {roomPlanWarnings.map((w, i) => (
+                  <div className="esr-upload-summary is-warn" key={i}>
+                    ⚠ {w}
+                  </div>
+                ))}
+
+                <div style={{ display: "flex", gap: "8px", flexWrap: "wrap", marginTop: "8px" }}>
+                  {(roomPlan.length > 0 || roomPlanFileNames.length > 0) && (
+                    <button type="button" className="esr-add-link" onClick={clearRoomPlan}>
+                      Clear room plan
+                    </button>
+                  )}
+                  <button type="button" className="esr-add-link" onClick={downloadSampleRoomPlan}>
+                    Download a sample sheet
+                  </button>
+                </div>
+
+                <p className="esr-teacher-hint">
+                  One row per room, with columns <strong>Room</strong>, <strong>Rows</strong>,{" "}
+                  <strong>Benches per row</strong>, <strong>Seats per bench</strong> and{" "}
+                  <strong>Branches allowed</strong>. Rooms are filled in the order listed, and
+                  each room can have its own size. In "Branches allowed" you can write:
+                </p>
+                <ul className="esr-teacher-hint esr-rule-list">
+                  <li>
+                    <code>CSE only</code> — just that branch
+                  </li>
+                  <li>
+                    <code>CSE, ECE</code> or <code>CSE and ECE</code> — those branches mixed
+                  </li>
+                  <li>
+                    <code>ALL</code> (or blank) — any branch
+                  </li>
+                  <li>
+                    <code>ALL except ECE</code> or <code>not ECE</code> — everyone but those
+                  </li>
+                  <li>
+                    <code>CSE:30, ECE:20</code> — allowed, with a maximum per branch
+                  </li>
+                </ul>
+                <p className="esr-teacher-hint">
+                  Word/PDF: one room per line, e.g. "Room 101, 3, 10, 2, CSE only".
                 </p>
               </>
             )}
@@ -1342,6 +1987,64 @@ export default function ExamSeatingRegister() {
             </div>
           </div>
 
+          <div className="esr-panel">
+            <h2>Printed sheet details</h2>
+            <label className="esr-field-label" style={{ marginTop: 0 }}>
+              Title line
+            </label>
+            <input
+              type="text"
+              value={noticeTitle}
+              onChange={(e) => setNoticeTitle(e.target.value)}
+              placeholder="Exam: AY 2026-27 (ODD) | MSE-1 | SEMESTER-5/7"
+              style={{
+                width: "100%",
+                font: "500 13px 'Figtree', sans-serif",
+                padding: "9px",
+                border: "1.5px solid var(--line)",
+                borderRadius: "8px",
+              }}
+            />
+            <div className="esr-num-row" style={{ marginTop: "10px" }}>
+              <div className="esr-num-field">
+                <label>Date</label>
+                <input
+                  type="text"
+                  value={noticeDate}
+                  onChange={(e) => setNoticeDate(e.target.value)}
+                  placeholder="23.09.2026"
+                />
+              </div>
+              <div className="esr-num-field">
+                <label>Time</label>
+                <input
+                  type="text"
+                  value={noticeTime}
+                  onChange={(e) => setNoticeTime(e.target.value)}
+                  placeholder="01:30 to 03:00"
+                />
+              </div>
+            </div>
+            <label className="esr-field-label">Room numbers (optional)</label>
+            <input
+              type="text"
+              value={roomNumbersText}
+              onChange={(e) => setRoomNumbersText(e.target.value)}
+              placeholder="166, 167, 168"
+              style={{
+                width: "100%",
+                font: "500 13px 'Figtree', sans-serif",
+                padding: "9px",
+                border: "1.5px solid var(--line)",
+                borderRadius: "8px",
+              }}
+            />
+            <p className="esr-teacher-hint">
+              One per room, comma-separated, in tab order. Leave blank to just show
+              "Room 1", "Room 2", etc.
+            </p>
+          </div>
+
           <button className="esr-generate" onClick={generate}>
             Generate seating chart
           </button>
@@ -1394,14 +2097,30 @@ export default function ExamSeatingRegister() {
                     className={`esr-tab ${activeRoom === i ? "active" : ""}`}
                     onClick={() => setActiveRoom(i)}
                   >
-                    Room {String(i + 1).padStart(2, "0")}
+                    {roomTitle(result.rooms[i], i)}
                   </button>
                 ))}
               </div>
 
               <div className="esr-room-body">
                 <div className="esr-room-head">
-                  <h3>Room {String(activeRoom + 1).padStart(2, "0")}</h3>
+                  <h3>{roomTitle(result.rooms[activeRoom], activeRoom)}</h3>
+                  <div className="esr-mode-toggle" style={{ width: "auto", marginBottom: 0 }}>
+                    <button
+                      type="button"
+                      className={`esr-mode-btn ${viewMode === "sheet" ? "active" : ""}`}
+                      onClick={() => setViewMode("sheet")}
+                    >
+                      Printed sheet
+                    </button>
+                    <button
+                      type="button"
+                      className={`esr-mode-btn ${viewMode === "cards" ? "active" : ""}`}
+                      onClick={() => setViewMode("cards")}
+                    >
+                      Cards
+                    </button>
+                  </div>
                   <button type="button" className="esr-print-btn" onClick={() => window.print()}>
                     Print this room
                   </button>
@@ -1424,47 +2143,115 @@ export default function ExamSeatingRegister() {
                     ))}
                   </div>
                 )}
-                <div className="esr-layout-note">
-                  <strong>Seating layout:</strong> {rowsPerRoom} row(s) × {benchesPerRow} bench(es) per row × {seatsPerBench} student(s) per bench
-                  = <strong>{rowsPerRoom * benchesPerRow * seatsPerBench} seats</strong> in this classroom.
-                </div>
-
-                {result.rooms[activeRoom].rows.map((benches, rIdx) => (
-                  <div className="esr-row-block" key={`row-${rIdx}`}>
-                    <div className="esr-row-title">
-                      Row {rIdx + 1} — {benches.length} benches
+                {(() => {
+                  const lay = result.rooms[activeRoom].layout || {
+                    rows: rowsPerRoom,
+                    benches: benchesPerRow,
+                    seats: seatsPerBench,
+                  };
+                  return (
+                    <div className="esr-layout-note">
+                      <strong>Seating layout:</strong> {lay.rows} row(s) × {lay.benches} bench(es) per row × {lay.seats} student(s) per bench
+                      = <strong>{lay.rows * lay.benches * lay.seats} seats</strong> in this classroom.
+                      {result.usingPlan && result.rooms[activeRoom].conditionText && (
+                        <>
+                          {" "}
+                          <strong>Rule:</strong> {result.rooms[activeRoom].conditionText}.
+                        </>
+                      )}
                     </div>
-                    <div
-                      className="esr-bench-grid"
-                      style={{ "--bench-count": benches.length }}
-                    >
-                      {benches.map((seats, bIdx) => (
-                        <div className="esr-bench-card" key={`row-${rIdx}-bench-${bIdx}`}>
-                          <div className="esr-bench-title">Bench {bIdx + 1}</div>
-                          {seats.map((id, sIdx) => {
-                            const details = id ? result.studentDetails?.[id] : null;
-                            const tooltip = details
-                              ? [details.name, details.subject].filter(Boolean).join(" • ")
-                              : undefined;
-                            return (
-                              <div
-                                key={sIdx}
-                                className={`esr-seat ${id ? "" : "empty"}`}
-                                style={id ? { "--seat-accent": branchColor(result.branchOrder, result.branchOf?.[id]) } : undefined}
-                                title={tooltip}
-                              >
-                                {id || "Empty"}
-                                {details?.name && (
-                                  <span className="esr-seat-name">{details.name}</span>
-                                )}
-                              </div>
-                            );
-                          })}
-                        </div>
-                      ))}
+                  );
+                })()}
+
+                {viewMode === "sheet" ? (
+                  <div className="esr-sheet">
+                    <div className="esr-sheet-head">
+                      <div className="esr-sheet-title">{noticeTitle}</div>
+                      <div className="esr-sheet-room">
+                        Room No : {roomLabel(activeRoom)}
+                      </div>
+                    </div>
+                    <div className="esr-sheet-subhead">
+                      <span />
+                      <span>Date: {noticeDate || "—"}</span>
+                      <span>Time: {noticeTime || "—"}</span>
+                    </div>
+                    <div className="esr-sheet-blocks">
+                      {result.rooms[activeRoom].rows.map((benches, rIdx) => {
+                        // One column header per seat position: whichever branch first
+                        // occupies that seat within this block of benches.
+                        const seatHeaders = Array.from({ length: benches[0] ? benches[0].length : 0 }).map(
+                          (_, sIdx) => {
+                            for (const seats of benches) {
+                              const id = seats[sIdx];
+                              if (id) return result.branchOf?.[id] || "";
+                            }
+                            return "";
+                          }
+                        );
+                        return (
+                          <table className="esr-sheet-table" key={`block-${rIdx}`}>
+                            <thead>
+                              <tr>
+                                <th className="esr-sheet-corner"></th>
+                                {seatHeaders.map((h, i) => (
+                                  <th key={i}>{h || "—"}</th>
+                                ))}
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {benches.map((seats, bIdx) => (
+                                <tr key={bIdx}>
+                                  <td className="esr-sheet-idx">{bIdx + 1}</td>
+                                  {seats.map((id, sIdx) => (
+                                    <td key={sIdx}>{id || ""}</td>
+                                  ))}
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        );
+                      })}
                     </div>
                   </div>
-                ))}
+                ) : (
+                  result.rooms[activeRoom].rows.map((benches, rIdx) => (
+                    <div className="esr-row-block" key={`row-${rIdx}`}>
+                      <div className="esr-row-title">
+                        Row {rIdx + 1} — {benches.length} benches
+                      </div>
+                      <div
+                        className="esr-bench-grid"
+                        style={{ "--bench-count": benches.length }}
+                      >
+                        {benches.map((seats, bIdx) => (
+                          <div className="esr-bench-card" key={`row-${rIdx}-bench-${bIdx}`}>
+                            <div className="esr-bench-title">Bench {bIdx + 1}</div>
+                            {seats.map((id, sIdx) => {
+                              const details = id ? result.studentDetails?.[id] : null;
+                              const tooltip = details
+                                ? [details.name, details.subject].filter(Boolean).join(" • ")
+                                : undefined;
+                              return (
+                                <div
+                                  key={sIdx}
+                                  className={`esr-seat ${id ? "" : "empty"}`}
+                                  style={id ? { "--seat-accent": branchColor(result.branchOrder, result.branchOf?.[id]) } : undefined}
+                                  title={tooltip}
+                                >
+                                  {id || "Empty"}
+                                  {details?.name && (
+                                    <span className="esr-seat-name">{details.name}</span>
+                                  )}
+                                </div>
+                              );
+                            })}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ))
+                )}
               </div>
 
               {result.conflicts > 0 && (
@@ -1490,11 +2277,24 @@ export default function ExamSeatingRegister() {
                 </div>
               )}
 
+              {result.usingPlan && result.planWarnings.length > 0 && (
+                <div className="esr-note">
+                  <div className="heading">Room plan notes</div>
+                  <div className="ids">
+                    {result.planWarnings.map((w, i) => (
+                      <div key={i}>• {w}</div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
               {result.unassigned.length > 0 && (
                 <div className="esr-note">
                   <div className="heading">
-                    {result.unassigned.length} student(s) could not be seated — capacity
-                    was exceeded
+                    {result.unassigned.length} student(s) could not be seated —{" "}
+                    {result.usingPlan
+                      ? "no room with a matching rule had space left"
+                      : "capacity was exceeded"}
                   </div>
                   <div className="ids">{result.unassigned.join(", ")}</div>
                 </div>
