@@ -1521,7 +1521,364 @@ export default function ExamSeatingRegister() {
           .esr-row-block { break-inside: avoid; }
           .esr-row-title { background: #e2e7ed; color: #000; }
         }
-`}</style>
+        
+/* ===== PROFESSIONAL INTERFACE UPGRADE ===== */
+
+.esr-wrap {
+  --ink: #142b4a;
+  --ink-2: #24476d;
+  --paper: #f3f6fb;
+  --sheet: #ffffff;
+  --line: #dce4ef;
+  --muted: #64748b;
+  --chalk: #f4c430;
+  --teal: #087f8c;
+  --teal-soft: #e5f6f6;
+
+  background: #f3f6fb;
+  color: #142b4a;
+  font-family: "Figtree", Arial, sans-serif;
+  line-height: 1.6;
+}
+
+/* Modern professional header */
+.esr-plate {
+  background:
+    radial-gradient(
+      circle,
+      rgba(255, 255, 255, 0.12) 1px,
+      transparent 1.6px
+    ) 0 0 / 24px 24px,
+    linear-gradient(125deg, #102746 0%, #1c456e 65%, #087f8c 100%);
+  border-bottom: 4px solid #f4c430;
+  padding: 54px 28px 76px;
+  text-align: left;
+}
+
+.esr-plate .eyebrow {
+  background: #f4c430;
+  color: #142b4a;
+  padding: 6px 14px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0.7px;
+  text-transform: uppercase;
+  margin-bottom: 18px;
+}
+
+.esr-plate h1 {
+  color: #ffffff;
+  font-size: clamp(32px, 4vw, 48px);
+  font-weight: 800;
+  line-height: 1.12;
+  letter-spacing: -1px;
+  margin: 0 0 14px;
+}
+
+.esr-plate p {
+  color: #dbeafe;
+  font-size: 15px;
+  line-height: 1.8;
+}
+
+.esr-plate-art {
+  width: 235px;
+  filter: drop-shadow(0 12px 22px rgba(0, 0, 0, 0.12));
+}
+
+/* Main page layout */
+.esr-grid {
+  max-width: 1380px;
+  grid-template-columns: minmax(300px, 360px) minmax(0, 1fr);
+  gap: 24px;
+  padding: 0 24px;
+  margin: -36px auto 0;
+  align-items: start;
+}
+
+.esr-left {
+  gap: 20px;
+}
+
+/* Clean cards */
+.esr-panel,
+.esr-output {
+  background: #ffffff;
+  border: 1px solid #dce4ef;
+  border-radius: 16px;
+  box-shadow: 0 8px 28px rgba(20, 43, 74, 0.06);
+}
+
+.esr-panel {
+  padding: 24px;
+}
+
+.esr-panel h2 {
+  color: #142b4a;
+  font-size: 19px;
+  border-bottom: 1px solid #e2e8f0;
+  padding-bottom: 14px;
+  margin-bottom: 18px;
+}
+
+/* Inputs and text areas */
+.esr-range-row input,
+.esr-num-field input,
+.esr-teacher-area {
+  border: 1px solid #cbd5e1;
+  border-radius: 9px;
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+
+.esr-range-row input:hover,
+.esr-num-field input:hover,
+.esr-teacher-area:hover {
+  border-color: #94a3b8;
+}
+
+.esr-range-row input:focus,
+.esr-num-field input:focus,
+.esr-teacher-area:focus {
+  border-color: #087f8c;
+  outline: none;
+  box-shadow: 0 0 0 3px rgba(8, 127, 140, 0.12);
+}
+
+/* Manual / upload selection */
+.esr-mode-toggle {
+  background: #f1f5f9;
+  border: 1px solid #dce4ef;
+  border-radius: 10px;
+  padding: 4px;
+  gap: 4px;
+}
+
+.esr-mode-btn {
+  border-radius: 7px;
+  padding: 11px 8px;
+  transition: background 0.2s, color 0.2s;
+}
+
+.esr-mode-btn + .esr-mode-btn {
+  border-left: none;
+}
+
+.esr-mode-btn:hover {
+  background: #e2e8f0;
+}
+
+.esr-mode-btn.active {
+  background: #142b4a;
+  color: #ffffff;
+}
+
+/* Primary generate button */
+.esr-generate {
+  background: #142b4a;
+  color: #ffffff;
+  border: 1px solid #142b4a;
+  border-radius: 10px;
+  padding: 14px 18px;
+  box-shadow: 0 5px 12px rgba(20, 43, 74, 0.16);
+  transition: background 0.2s, transform 0.2s, box-shadow 0.2s;
+}
+
+.esr-generate:hover {
+  background: #087f8c;
+  border-color: #087f8c;
+  box-shadow: 0 7px 16px rgba(8, 127, 140, 0.2);
+  transform: translateY(-1px);
+}
+
+.esr-generate:active {
+  transform: translateY(0);
+}
+
+/* Secondary buttons */
+.esr-add-link,
+.esr-print-btn {
+  border: 1px solid #cbd5e1;
+  border-radius: 9px;
+  color: #24476d;
+  background: #ffffff;
+  transition: all 0.2s;
+}
+
+.esr-add-link:hover,
+.esr-print-btn:hover {
+  background: #142b4a;
+  border-color: #142b4a;
+  color: #ffffff;
+}
+
+/* Upload areas */
+.esr-file-drop {
+  background: #f8fafc;
+  border: 1.5px dashed #94a3b8;
+  border-radius: 12px;
+  padding: 24px 14px;
+  transition: background 0.2s, border-color 0.2s;
+}
+
+.esr-file-drop:hover {
+  background: #eaf7f7;
+  border-color: #087f8c;
+}
+
+/* Summary statistics */
+.esr-summary {
+  background: #ffffff;
+  border-bottom: 1px solid #dce4ef;
+}
+
+.esr-stat {
+  padding: 20px 18px;
+  border-right: 1px solid #e2e8f0;
+}
+
+.esr-stat .num {
+  color: #142b4a;
+  font-size: 29px;
+}
+
+.esr-stat .label {
+  color: #64748b;
+  font-size: 12px;
+}
+
+/* Room navigation tabs */
+.esr-tabs {
+  background: #f1f5f9;
+  gap: 8px;
+  padding: 14px 18px 0;
+}
+
+.esr-tab {
+  background: #e8eef6;
+  color: #475569;
+  border: 1px solid #dce4ef;
+  border-radius: 8px 8px 0 0;
+  padding: 10px 16px;
+}
+
+.esr-tab:hover {
+  background: #ffffff;
+  color: #142b4a;
+}
+
+.esr-tab.active {
+  background: #ffffff;
+  color: #142b4a;
+  box-shadow: inset 0 3px 0 #087f8c;
+}
+
+/* Room and seating layout */
+.esr-room-body {
+  padding: 26px;
+}
+
+.esr-room-head h3 {
+  color: #142b4a;
+}
+
+.esr-invigilator {
+  background: #eff6ff;
+  border: 1px solid #dbeafe;
+  border-radius: 9px;
+}
+
+.esr-layout-note {
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-left: 4px solid #087f8c;
+  border-radius: 8px;
+  padding: 13px 16px;
+  color: #334155;
+}
+
+.esr-row-block {
+  border: 1px solid #dce4ef;
+  border-radius: 12px;
+  box-shadow: 0 3px 10px rgba(20, 43, 74, 0.035);
+}
+
+.esr-row-title {
+  background: #eaf0f7;
+  color: #142b4a;
+  padding: 11px 15px;
+  border-bottom: 1px solid #dce4ef;
+}
+
+.esr-bench-card {
+  background: #f8fafc;
+  border: 1px solid #dce4ef;
+  border-bottom: 3px solid #cbd5e1;
+  border-radius: 9px;
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+
+.esr-bench-card:hover {
+  border-bottom-color: #087f8c;
+  box-shadow: 0 3px 10px rgba(20, 43, 74, 0.06);
+}
+
+.esr-seat {
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-left: 4px solid var(--seat-accent, #cbd5e1);
+  border-radius: 7px;
+}
+
+.esr-seat.empty {
+  background: #f8fafc;
+  border: 1px dashed #cbd5e1;
+}
+
+/* Better spacing on phones and tablets */
+@media (max-width: 880px) {
+  .esr-grid {
+    grid-template-columns: minmax(0, 1fr);
+    margin-top: -28px;
+  }
+
+  .esr-plate {
+    padding: 38px 22px 56px;
+  }
+}
+
+@media (max-width: 600px) {
+  .esr-grid {
+    padding: 0 12px;
+    gap: 16px;
+  }
+
+  .esr-panel {
+    padding: 18px;
+  }
+
+  .esr-room-body {
+    padding: 16px;
+  }
+
+  .esr-plate h1 {
+    font-size: 34px;
+  }
+
+  .esr-plate p {
+    font-size: 14px;
+  }
+
+  .esr-bench-grid {
+    grid-template-columns: repeat(
+      var(--bench-count),
+      minmax(96px, 1fr)
+    );
+    overflow-x: auto;
+  }
+}
+
+`}</style>    
 
       <div className="esr-plate">
         <div className="esr-plate-inner">
@@ -1850,32 +2207,7 @@ export default function ExamSeatingRegister() {
                   </button>
                 </div>
 
-                <p className="esr-teacher-hint">
-                  One row per room, with columns <strong>Room</strong>, <strong>Rows</strong>,{" "}
-                  <strong>Benches per row</strong>, <strong>Seats per bench</strong> and{" "}
-                  <strong>Branches allowed</strong>. Rooms are filled in the order listed, and
-                  each room can have its own size. In "Branches allowed" you can write:
-                </p>
-                <ul className="esr-teacher-hint esr-rule-list">
-                  <li>
-                    <code>CSE only</code> — just that branch
-                  </li>
-                  <li>
-                    <code>CSE, ECE</code> or <code>CSE and ECE</code> — those branches mixed
-                  </li>
-                  <li>
-                    <code>ALL</code> (or blank) — any branch
-                  </li>
-                  <li>
-                    <code>ALL except ECE</code> or <code>not ECE</code> — everyone but those
-                  </li>
-                  <li>
-                    <code>CSE:30, ECE:20</code> — allowed, with a maximum per branch
-                  </li>
-                </ul>
-                <p className="esr-teacher-hint">
-                  Word/PDF: one room per line, e.g. "Room 101, 3, 10, 2, CSE only".
-                </p>
+               
               </>
             )}
 
