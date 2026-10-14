@@ -7,6 +7,10 @@ import JSZip from "jszip"; // new: needed for .pptx  ->  npm install jszip
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsWorker;
 
+// Banner picture shown at the top of the page. Put the file in your project's "public"
+// folder (next to src), so this address finds it.
+const HERO_IMAGE = "/exam-seating-hero.webp";
+
 // Starts at 2 because the two default ranges below already use ids rng-1 and rng-2.
 // Starting at 0 caused the third range added to reuse id "rng-1", which made React
 // confuse that new row with the first one — editing one row's Start/End appeared to
@@ -57,38 +61,136 @@ function branchFromFileName(fileName) {
   return !token || /^(STUDENTS?|LIST|MORE|DATA|SAMPLE|ALL)$/.test(token) ? "Unknown" : token;
 }
 
+// Turns a full branch name into its usual short form by taking the first letter of each
+// meaningful word: "Computer Science & Engineering" -> CSE, "Information Science &
+// Engineering" -> ISE, "Artificial Intelligence & Data Science" -> AIDS, "Aeronautical
+// Engineering" -> AE. A name that is already short (one word of up to 5 letters) is kept;
+// a long single word falls back to the branch code.
+function abbreviateBranch(fullName, code) {
+  const fallback = String(code ?? "").trim();
+  const name = String(fullName ?? "").trim();
+  if (!name) return fallback;
+  const words = name
+    .replace(/\(.*?\)/g, " ")
+    .split(/[\s&,/+-]+/)
+    .filter((w) => w && !/^(and|of|in|the|for)$/i.test(w));
+  if (words.length === 0) return fallback || name;
+  if (words.length === 1) {
+    return words[0].length <= 5 ? words[0].toUpperCase() : fallback || words[0].slice(0, 4).toUpperCase();
+  }
+  return words.map((w) => w[0]).join("").toUpperCase();
+}
+
 // Parse a 2D array of rows (from Excel/CSV) into student records.
-// Expects a header row containing recognizable column names.
+// Finds the heading row even when there are blank or title rows above it, then picks
+// columns by their headings. Branch label, in order of preference: a "Branch Short Form"
+// column if there is one; otherwise the short form worked out from a "Branch Name" column
+// (CSE, ISE, AIDS...); otherwise the branch code / branch column as written. The code and
+// full name are kept too, so room-plan rules can use either.
 function parseSheetRows(rows) {
   const warnings = [];
   if (!rows || rows.length === 0) {
     return { students: [], warnings: ["The file appears to be empty."] };
   }
-  const header = rows[0].map((h) => String(h ?? "").trim().toLowerCase());
-  const findCol = (pattern) => header.findIndex((h) => pattern.test(h));
+  const idRe = /^(roll|student)?[\s._-]*(no|number|id)\b|^roll/;
+  const clean = (row) => (row || []).map((h) => String(h ?? "").trim().toLowerCase());
+
+  let headerRow = 0;
+  for (let i = 0; i < Math.min(rows.length, 10); i += 1) {
+    const h = clean(rows[i]);
+    if (
+      h.some((x) => idRe.test(x)) &&
+      h.some((x) => /name|branch|dept|department|subject|paper|course|exam/.test(x))
+    ) {
+      headerRow = i;
+      break;
+    }
+  }
+  const header = clean(rows[headerRow]);
+  const findCol = (...patterns) => {
+    for (const p of patterns) {
+      const i = header.findIndex((h) => p.test(h));
+      if (i !== -1) return i;
+    }
+    return -1;
+  };
   const idx = {
-    id: findCol(/^(roll|student)?[\s._-]*(no|number|id)\b|^roll/),
-    name: findCol(/name/),
-    branch: findCol(/branch|dept|department/),
-    subject: findCol(/subject|paper|course/),
+    id: findCol(idRe),
+    name: findCol(
+      /student.*name|^(full )?name$/,
+      /^(?!.*(branch|dept|department|subject|paper|course)).*name/
+    ),
+    branchShort: findCol(
+      /(branch|dept|department).*(short|abbr)|(short|abbr).*(branch|dept|department)|^short[\s._-]*(form|name)$/
+    ),
+    branchCode: findCol(/(branch|dept|department).*code|code.*(branch|dept|department)/),
+    branchName: findCol(/(branch|dept|department).*(name|title)|(name|title).*(branch|dept|department)/),
+    branchAny: findCol(/branch|dept|department/),
+    subject: findCol(
+      /(subject|paper|course).*(name|title)/,
+      /subject|paper|course/,
+      /exam\s*writes|exam\s*subject/
+    ),
   };
   if (idx.id === -1) {
     warnings.push("Couldn't find a Roll No / ID column by name — using the first column.");
   }
   const students = [];
-  for (let r = 1; r < rows.length; r += 1) {
+  for (let r = headerRow + 1; r < rows.length; r += 1) {
     const row = rows[r] || [];
     const isBlank = row.every((c) => c === undefined || c === null || String(c).trim() === "");
     if (isBlank) continue;
+    const cell = (i) => (i !== -1 ? String(row[i] ?? "").trim() : "");
     const id = String(row[idx.id !== -1 ? idx.id : 0] ?? "").trim();
     if (!id) continue;
+
+    const shortCell = cell(idx.branchShort);
+    const code = cell(idx.branchCode);
+    const fullName = cell(idx.branchName);
+    let branch;
+    let derived = false;
+    if (shortCell) {
+      branch = shortCell;
+    } else if (fullName) {
+      branch = abbreviateBranch(fullName, code);
+      derived = true;
+    } else {
+      branch = code || cell(idx.branchAny);
+    }
     students.push({
       id,
-      name: idx.name !== -1 ? String(row[idx.name] ?? "").trim() : "",
-      branch: idx.branch !== -1 ? String(row[idx.branch] ?? "").trim() || "Unknown" : "Unknown",
-      subject: idx.subject !== -1 ? String(row[idx.subject] ?? "").trim() : "",
+      name: cell(idx.name),
+      branch: branch || "Unknown",
+      subject: cell(idx.subject),
+      branchCode: code,
+      branchName: fullName,
+      derived,
     });
   }
+
+  // If two different full names would get the same short form, fall back to their codes
+  // so they stay separate branches.
+  const namesByShort = {};
+  students.forEach((s) => {
+    if (!s.derived) return;
+    if (!namesByShort[s.branch]) namesByShort[s.branch] = new Set();
+    namesByShort[s.branch].add(s.branchName);
+  });
+  Object.keys(namesByShort).forEach((short) => {
+    if (namesByShort[short].size < 2) return;
+    const list = [...namesByShort[short]];
+    warnings.push(
+      `${list.join(" and ")} would both be shortened to "${short}", so their branch codes are used instead.`
+    );
+    students.forEach((s) => {
+      if (s.derived && s.branch === short) {
+        s.branch = s.branchCode || `${short}-${list.indexOf(s.branchName) + 1}`;
+      }
+    });
+  });
+  students.forEach((s) => {
+    delete s.derived;
+  });
   return { students, warnings };
 }
 
@@ -260,15 +362,20 @@ function describeCondition(cond) {
 
 // Matches the names in a rule against the branches that really exist in the student
 // list (case-insensitive) and returns what the room may seat.
-function resolveCondition(cond, branchOrder) {
+function resolveCondition(cond, branchOrder, aliases = {}) {
   const lookup = {};
   branchOrder.forEach((b) => {
     lookup[b.toLowerCase()] = b;
   });
+  // Other names a branch goes by (e.g. its code "CS" for "CSE") also point to it, but
+  // never override a branch's own name.
+  Object.entries(aliases).forEach(([alias, canonical]) => {
+    if (!lookup[alias] && branchOrder.includes(canonical)) lookup[alias] = canonical;
+  });
   const unknown = [];
   let allowed = [];
   if (cond.any) {
-    const ex = new Set(cond.except.map((n) => n.toLowerCase()));
+    const ex = new Set(cond.except.map((n) => (lookup[n.toLowerCase()] || n).toLowerCase()));
     cond.except.forEach((n) => {
       if (!lookup[n.toLowerCase()]) unknown.push(n);
     });
@@ -326,11 +433,13 @@ function parseRoomPlanSheet(rows) {
 
   let idx = null;
   let start = 1;
+  let positional = false;
   for (let h = 0; h < Math.min(rows.length, 6) && !idx; h += 1) {
     idx = detectRoomPlanColumns(rows[h]);
     if (idx) start = h + 1;
   }
   if (!idx) {
+    positional = true;
     const widest = Math.max(...rows.map((r) => (r ? r.length : 0)));
     idx = {
       name: 0,
@@ -376,7 +485,7 @@ function parseRoomPlanSheet(rows) {
     });
   }
   if (out.length === 0) warnings.push("No valid rooms were found.");
-  return { rooms: out, warnings };
+  return { rooms: out, warnings, positional };
 }
 
 // Reads rooms from plain text (Word/PDF). One room per line:
@@ -417,14 +526,14 @@ function parseRoomPlanText(text) {
 // Seats students room by room, following each room's own layout and branch rule.
 // Rooms are filled in the order they appear in the plan. A room never takes a branch
 // its rule doesn't allow, and never exceeds a branch's per-room maximum.
-function seatByRoomPlan({ plan, queues, branchOrder, avoidSameBranch }) {
+function seatByRoomPlan({ plan, queues, branchOrder, avoidSameBranch, aliases = {} }) {
   let conflicts = 0;
   const warnings = [];
   const mentioned = new Set();
   const rooms = [];
 
   for (const room of plan) {
-    const { allowed, quotas, unknown } = resolveCondition(room.condition, branchOrder);
+    const { allowed, quotas, unknown } = resolveCondition(room.condition, branchOrder, aliases);
     allowed.forEach((b) => mentioned.add(b));
     if (unknown.length) {
       warnings.push(
@@ -439,10 +548,14 @@ function seatByRoomPlan({ plan, queues, branchOrder, avoidSameBranch }) {
     allowed.forEach((b) => {
       seatedHere[b] = 0;
     });
-    const eligible = () =>
-      allowed.filter(
-        (b) => queues[b].length > 0 && (quotas[b] === undefined || seatedHere[b] < quotas[b])
-      );
+    // How many more of a branch THIS room can still take (its own maximum, if it has
+    // one, or whatever students are left). Comparing this - not the school-wide
+    // remaining count - is what keeps a room with per-branch maximums evenly mixed.
+    const available = (b) =>
+      quotas[b] === undefined
+        ? queues[b].length
+        : Math.min(queues[b].length, quotas[b] - seatedHere[b]);
+    const eligible = () => allowed.filter((b) => available(b) > 0);
     // A room that may only hold one branch can't keep branches apart on a bench, and
     // that's the person's own rule - so it isn't counted as a clash.
     const canMix = allowed.length > 1;
@@ -467,7 +580,7 @@ function seatByRoomPlan({ plan, queues, branchOrder, avoidSameBranch }) {
               fresh = candidates;
               conflicts += 1;
             }
-            fresh = [...fresh].sort((a, c) => queues[c].length - queues[a].length);
+            fresh = [...fresh].sort((a, c) => available(c) - available(a));
             pick = fresh[0];
           } else {
             pick = candidates[0];
@@ -554,6 +667,7 @@ export default function ExamSeatingRegister() {
   const [noticeDate, setNoticeDate] = useState("");
   const [noticeTime, setNoticeTime] = useState("");
   const [roomNumbersText, setRoomNumbersText] = useState("");
+  const [heroFailed, setHeroFailed] = useState(false); // true if the banner picture is missing
   const [error, setError] = useState("");
 
   function updateRange(id, field, value) {
@@ -753,6 +867,9 @@ export default function ExamSeatingRegister() {
               XLSX.utils.sheet_to_json(wb.Sheets[sheetName], { header: 1 })
             );
             if (firstWarnings === null) firstWarnings = one.warnings;
+            // With several tabs, ignore any that don't have room headings (e.g. a notes
+            // or summary tab) rather than guessing at their columns.
+            if (one.positional && wb.SheetNames.length > 1) return;
             if (one.rooms.length > 0) {
               found.push(...one.rooms);
               newWarnings.push(
@@ -837,6 +954,8 @@ export default function ExamSeatingRegister() {
     const branchOrder = [];
     const queues = {};
     const studentDetails = {}; // id -> { name, subject }
+    const branchAliases = {}; // other names for a branch (its code) -> its short form
+    const branchFull = {}; // short form -> full branch name, for the key shown on screen
 
     if (inputMode === "upload") {
       if (uploadedStudents.length === 0) {
@@ -851,6 +970,11 @@ export default function ExamSeatingRegister() {
         }
         queues[branch].push(s.id);
         studentDetails[s.id] = { name: s.name, subject: s.subject };
+        if (s.branchName && !branchFull[branch]) branchFull[branch] = s.branchName;
+        [s.branchCode, s.branchName].forEach((alias) => {
+          const key = String(alias || "").trim().toLowerCase();
+          if (key && key !== branch.toLowerCase()) branchAliases[key] = branch;
+        });
       }
     } else {
       const cleanRanges = ranges
@@ -1043,7 +1167,13 @@ export default function ExamSeatingRegister() {
     let rooms = [];
     if (usingPlan) {
       // Room plan uploaded: every room has its own layout and its own branch rule.
-      const planned = seatByRoomPlan({ plan: roomPlan, queues, branchOrder, avoidSameBranch });
+      const planned = seatByRoomPlan({
+        plan: roomPlan,
+        queues,
+        branchOrder,
+        avoidSameBranch,
+        aliases: branchAliases,
+      });
       rooms = planned.rooms;
       conflicts = planned.conflicts;
       planWarnings = planned.warnings;
@@ -1106,6 +1236,7 @@ export default function ExamSeatingRegister() {
       branchOrder: [...branchOrder],
       usingPlan,
       planWarnings,
+      branchFull,
     });
     setActiveRoom(0);
   }
@@ -1490,6 +1621,8 @@ export default function ExamSeatingRegister() {
         }
         .esr-sheet-subhead span:last-child { text-align: right; }
         .esr-sheet-blocks { display: flex; gap: 18px; align-items: flex-start; }
+        .esr-sheet-key { margin-top: 12px; font: 600 12px 'Figtree', sans-serif; color: #000; }
+        .esr-chip-full { font-weight: 500; font-size: 11.5px; color: var(--muted); }
         table.esr-sheet-table { border-collapse: collapse; flex: 1 1 0; min-width: 0; }
         .esr-sheet-table th {
           border: 1.5px solid #000; padding: 8px 6px; text-align: center;
@@ -1521,7 +1654,7 @@ export default function ExamSeatingRegister() {
           .esr-row-block { break-inside: avoid; }
           .esr-row-title { background: #e2e7ed; color: #000; }
         }
-        
+
 /* ===== PROFESSIONAL INTERFACE UPGRADE ===== */
 
 .esr-wrap {
@@ -1878,9 +2011,43 @@ export default function ExamSeatingRegister() {
   }
 }
 
-`}</style>    
+/* ===== HERO BANNER (the picture at the top of the page) ===== */
 
-      <div className="esr-plate">
+/* The banner's bottom wave is exactly this off-white, so the page continues
+   from it with no visible seam. */
+.esr-wrap { background: #f8fafc; }
+
+.esr-hero { display: block; }
+.esr-hero-banner {
+  line-height: 0;
+  aspect-ratio: 2170 / 725;          /* reserves the space so the page doesn't jump while the image loads */
+  background: linear-gradient(120deg, #0a2a55 0%, #0d3a72 60%, #1c6fc0 100%);
+}
+.esr-hero-img { display: block; width: 100%; height: auto; }
+
+/* The text header only shows if the picture can't load, or on narrow screens
+   where the words baked into the picture would be too small to read. */
+.esr-plate-live { display: none; }
+.esr-plate-live.is-fallback { display: block; }
+@media (max-width: 900px) {
+  .esr-hero-banner { display: none; }
+  .esr-plate-live { display: block; }
+}
+@media print { .esr-hero { display: none !important; } }
+`}</style>
+
+      <header className="esr-hero">
+        {!heroFailed && (
+          <div className="esr-hero-banner">
+            <img
+              className="esr-hero-img"
+              src={HERO_IMAGE}
+              alt="Exam Seating Register, Examination cell. Assigns students to classrooms, rows, benches and seats, with invigilators."
+              onError={() => setHeroFailed(true)}
+            />
+          </div>
+        )}
+      <div className={`esr-plate esr-plate-live${heroFailed ? " is-fallback" : ""}`}>
         <div className="esr-plate-inner">
           <div className="esr-plate-text">
             <div className="eyebrow">Examination cell</div>
@@ -1909,6 +2076,7 @@ export default function ExamSeatingRegister() {
           </svg>
         </div>
       </div>
+      </header>
 
       <div className="esr-grid">
         <div className="esr-left">
@@ -2207,7 +2375,32 @@ export default function ExamSeatingRegister() {
                   </button>
                 </div>
 
-               
+                <p className="esr-teacher-hint">
+                  One row per room, with columns <strong>Room</strong>, <strong>Rows</strong>,{" "}
+                  <strong>Benches per row</strong>, <strong>Seats per bench</strong> and{" "}
+                  <strong>Branches allowed</strong>. Rooms are filled in the order listed, and
+                  each room can have its own size. In "Branches allowed" you can write:
+                </p>
+                <ul className="esr-teacher-hint esr-rule-list">
+                  <li>
+                    <code>CSE only</code> — just that branch
+                  </li>
+                  <li>
+                    <code>CSE, ECE</code> or <code>CSE and ECE</code> — those branches mixed
+                  </li>
+                  <li>
+                    <code>ALL</code> (or blank) — any branch
+                  </li>
+                  <li>
+                    <code>ALL except ECE</code> or <code>not ECE</code> — everyone but those
+                  </li>
+                  <li>
+                    <code>CSE:30, ECE:20</code> — allowed, with a maximum per branch
+                  </li>
+                </ul>
+                <p className="esr-teacher-hint">
+                  Word/PDF: one room per line, e.g. "Room 101, 3, 10, 2, CSE only".
+                </p>
               </>
             )}
 
@@ -2468,9 +2661,16 @@ export default function ExamSeatingRegister() {
                 {result.rooms[activeRoom].allowedBranches.length > 0 && (
                   <div className="esr-legend">
                     {result.rooms[activeRoom].allowedBranches.map((b) => (
-                      <span key={b} className="esr-chip">
+                      <span
+                        key={b}
+                        className="esr-chip"
+                        title={result.branchFull?.[b] || undefined}
+                      >
                         <i style={{ background: branchColor(result.branchOrder, b) }} />
                         {b}
+                        {result.branchFull?.[b] && result.branchFull[b] !== b && (
+                          <small className="esr-chip-full">{result.branchFull[b]}</small>
+                        )}
                       </span>
                     ))}
                   </div>
@@ -2545,6 +2745,16 @@ export default function ExamSeatingRegister() {
                         );
                       })}
                     </div>
+                    {(() => {
+                      const keyed = result.rooms[activeRoom].allowedBranches.filter(
+                        (b) => result.branchFull?.[b] && result.branchFull[b] !== b
+                      );
+                      return keyed.length > 0 ? (
+                        <div className="esr-sheet-key">
+                          {keyed.map((b) => `${b} = ${result.branchFull[b]}`).join("   |   ")}
+                        </div>
+                      ) : null;
+                    })()}
                   </div>
                 ) : (
                   result.rooms[activeRoom].rows.map((benches, rIdx) => (
