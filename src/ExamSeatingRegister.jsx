@@ -9,8 +9,7 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsWorker;
 
 // Banner picture shown at the top of the page. Put the file in your project's "public"
 // folder (next to src), so this address finds it.
-const HERO_IMAGE = "/exam-seating-hero.webp";
-
+import HERO_IMAGE from "./assets/hero.png";
 // Starts at 2 because the two default ranges below already use ids rng-1 and rng-2.
 // Starting at 0 caused the third range added to reuse id "rng-1", which made React
 // confuse that new row with the first one — editing one row's Start/End appeared to
